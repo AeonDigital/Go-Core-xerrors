@@ -1,0 +1,164 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ------------------------------------------------------------
+  # JOB 1: TEST SUITE & SECURITY ANALYSIS (Runs on Push and PRs)
+  # ------------------------------------------------------------
+  test:
+    name: Run Tests & Security (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version: "1.26.2"
+
+      - name: Run Tests in All Modules
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter "go.mod" | ForEach-Object {
+            $dir = $_.DirectoryName
+            Write-Host "========================================="
+            Write-Host "Running tests in module: $dir"
+            Write-Host "========================================="
+            Set-Location $dir
+            go test -v -cover ./...
+            Set-Location $env:GITHUB_WORKSPACE
+          }
+
+  # ------------------------------------------------------------
+  # JOB 2: COMPILATION INTEGRITY CHECK (Pre-verification stage)
+  # ------------------------------------------------------------
+  build-check:
+    name: Verify Code Compilation
+    needs: test # Only runs if tests pass
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      - name: Pre-Build Verification
+        run: |
+          echo "========================================="
+          echo "Running pre-flight verification build..."
+          echo "========================================="
+          find . -name "go.mod" | while read -r modfile; do
+            dir=$(dirname "$modfile")
+            echo "Validating Go compilation in: $dir"
+            cd "$dir"
+            go build ./...
+            cd - > /dev/null
+          done
+
+  # ------------------------------------------------------------
+  # JOB 3: RELEASE & ARTIFACT GENERATION (Executes Safely Last)
+  # ------------------------------------------------------------
+  release:
+    name: Auto Tag, Versioning & Build
+    needs: build-check # CRITICAL SAFETY: Only runs if both tests AND verification builds pass
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      - name: Check for Official Entry Points from Text File
+        id: check_executable
+        run: |
+          ENTRY_FILE=".github/entrypoints.txt"
+          if [ -f "$ENTRY_FILE" ] && grep -v '^#' "$ENTRY_FILE" | grep -q '[^[:space:]]'; then
+            echo "[+] Entry points file found with active paths. Enabling GoReleaser engine."
+            echo "has_main=true" >> $GITHUB_OUTPUT
+          else
+            echo "[-] Entry points file is missing, empty, or contains only comments. Treating repository strictly as a library."
+            echo "has_main=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine Next Version and Manage Tag
+        id: versioning
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Current version: $LATEST_TAG"
+
+          VERSION_CLEAN=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_CLEAN"
+
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+
+          if [[ "$COMMIT_MSG" =~ ^release:\ (v[0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            NEXT_TAG="${BASH_REMATCH}"
+            echo "Manual release override detected via commit message."
+          elif [ "$LATEST_TAG" = "v0.0.0" ]; then
+            NEXT_TAG="v0.0.1"
+            echo "No prior tags found. Initializing repository versioning."
+          elif [[ "$COMMIT_MSG" == *"BREAKING CHANGE"* ]]; then
+            NEXT_TAG="v$((MAJOR + 1)).0.0"
+          elif [[ "$COMMIT_MSG" =~ ^feat: ]]; then
+            NEXT_TAG="v$MAJOR.$((MINOR + 1)).0"
+          else
+            NEXT_TAG="v$MAJOR.$MINOR.$((PATCH + 1))"
+          fi
+
+          echo "Calculated next version: $NEXT_TAG"
+          echo "next_tag=$NEXT_TAG" >> $GITHUB_OUTPUT
+
+          # Tag configuration and application
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag "$NEXT_TAG"
+          git push origin "$NEXT_TAG"
+          echo "Success: Version tag $NEXT_TAG published."
+
+      - name: Run GoReleaser (Publish Cross-Platform Binaries)
+        # This will execute natively only if has_main evaluates to true
+        if: steps.check_executable.outputs.has_main == 'true'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean -f .github/goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
